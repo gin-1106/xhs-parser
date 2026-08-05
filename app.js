@@ -19,43 +19,57 @@ app.all('/api/xhs-card', async (req, res) => {
         'Connection': 'keep-alive',
         'Referer': 'https://www.xiaohongshu.com/',
         'Upgrade-Insecure-Requests': '1'
-      }
+      },
+      redirect: 'follow'
     });
 
     const html = await response.text();
 
-    // 如果返回的 HTML 里包含 "登录" 相关关键词，说明被拦截了
-    if (html.includes('登录') || html.includes('login') || html.includes('verify')) {
+    // 如果返回的 HTML 里包含明显拦截关键词，说明被拦了
+    if (html.includes('登录后查看') || html.includes('请登录') || html.includes('captcha') || html.includes('verify')) {
       return res.json({ ok: false, error: '请求被拦截，可能需要更换 IP 或稍后再试' });
     }
 
     // 从 HTML 里提取 __INITIAL_STATE__
-    const match = html.match(/window\.__INITIAL_STATE__\s*=\s*({.*?});/s);
+    const match = html.match(/window\.__INITIAL_STATE__\s*=\s*(\{[\s\S]*?\});?\s*(?:<\/script>|$)/);
     if (!match) {
-      // 尝试找其他可能的数据源
-      const altMatch = html.match(/<script>window\.__INITIAL_STATE__\s*=\s*({.*?})<\/script>/s);
-      if (!altMatch) {
-        return res.json({ ok: false, error: '未找到数据，页面结构可能已变化' });
-      }
-      var state = JSON.parse(altMatch[1]);
-    } else {
-      var state = JSON.parse(match[1]);
+      return res.json({ ok: false, error: '未找到数据，页面结构可能已变化' });
     }
 
-    const note = state.noteData?.data?.noteData || state.noteData?.normalNotePreloadData;
+    // 关键：把 undefined 处理成合法 JSON
+    let raw = match[1]
+      .replace(/:undefined/g, ':null')
+      .replace(/,undefined/g, ',null')
+      .replace(/undefined,/g, 'null,')
+      .replace(/undefined}/g, 'null}');
+
+    let state;
+    try {
+      state = JSON.parse(raw);
+    } catch (e) {
+      return res.json({ ok: false, error: 'JSON 解析失败: ' + e.message });
+    }
+
+    // 兼容更多数据路径
+    const note =
+      state.noteData?.data?.noteData ||
+      state.noteData?.normalNotePreloadData ||
+      (state.note?.noteDetailMap && Object.values(state.note.noteDetailMap)[0]?.note) ||
+      null;
+
     if (!note) {
-      return res.json({ ok: false, error: '解析数据失败' });
+      return res.json({ ok: false, error: '解析数据失败，数据结构已变化' });
     }
 
     // 提取图片 URL
     const images = (note.imageList || []).map(img => {
-      let imgUrl = img.url || img;
+      let imgUrl = img.urlDefault || img.url || img;
       if (typeof imgUrl === 'string') {
         imgUrl = imgUrl.replace(/\\u002F/g, '/');
         if (imgUrl.startsWith('//')) imgUrl = 'https:' + imgUrl;
       }
       return imgUrl;
-    });
+    }).filter(Boolean);
 
     res.json({
       ok: true,
@@ -82,18 +96,27 @@ app.all('/api/xhs-card', async (req, res) => {
 app.post('/api/xhs-images', async (req, res) => {
   try {
     const { urls } = req.body;
+    if (!urls || !Array.isArray(urls)) {
+      return res.json({ ok: false, error: '请提供 urls 数组' });
+    }
+
     const results = await Promise.all(urls.map(async (url) => {
-      const response = await fetch(url, {
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1',
-          'Referer': 'https://www.xiaohongshu.com/'
-        }
-      });
-      const buffer = await response.arrayBuffer();
-      const base64 = Buffer.from(buffer).toString('base64');
-      const mime = response.headers.get('content-type') || 'image/jpeg';
-      return { url, base64, mime };
+      try {
+        const response = await fetch(url, {
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1',
+            'Referer': 'https://www.xiaohongshu.com/'
+          }
+        });
+        const buffer = await response.arrayBuffer();
+        const base64 = Buffer.from(buffer).toString('base64');
+        const mime = response.headers.get('content-type') || 'image/jpeg';
+        return { url, base64, mime };
+      } catch (err) {
+        return { url, error: err.message };
+      }
     }));
+
     res.json({ ok: true, images: results });
   } catch (e) {
     res.json({ ok: false, error: e.message });
