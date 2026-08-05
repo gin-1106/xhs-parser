@@ -2,14 +2,38 @@ import express from 'express';
 const app = express();
 app.use(express.json());
 
+// 从分享文案或纯链接里提取可用的小红书链接
+function extractXhsUrl(input) {
+  if (!input || typeof input !== 'string') return null;
+  const text = input.trim();
+
+  // 已经是完整链接
+  const longMatch = text.match(/https?:\/\/(?:www\.)?xiaohongshu\.com\/(?:explore|discovery\/item|notes)\/[0-9a-zA-Z]+[^\s]*/i);
+  if (longMatch) return longMatch[0];
+
+  // 短链 xhslink.com / xhslink.cn
+  const shortMatch = text.match(/https?:\/\/xhslink\.(?:com|cn)\/[a-zA-Z0-9\/._?%&=+-]+/i);
+  if (shortMatch) return shortMatch[0];
+
+  // 有时是不带协议的
+  const shortNoProto = text.match(/xhslink\.(?:com|cn)\/[a-zA-Z0-9\/._?%&=+-]+/i);
+  if (shortNoProto) return 'http://' + shortNoProto[0];
+
+  // 整段就是一个链接
+  if (/^https?:\/\//i.test(text)) return text;
+
+  return null;
+}
+
 app.all('/api/xhs-card', async (req, res) => {
   try {
-    const url = req.query.url || req.body.url;
+    const raw = req.query.url || req.body.url || req.body.text || '';
+    const url = extractXhsUrl(raw);
+
     if (!url) {
-      return res.json({ ok: false, error: '请提供 url 参数' });
+      return res.json({ ok: false, error: '未识别到小红书链接，请粘贴分享文案或链接' });
     }
 
-    // 完整的手机浏览器伪装头
     const response = await fetch(url, {
       headers: {
         'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1',
@@ -23,21 +47,19 @@ app.all('/api/xhs-card', async (req, res) => {
       redirect: 'follow'
     });
 
+    const finalUrl = response.url || url;
     const html = await response.text();
 
-    // 如果返回的 HTML 里包含明显拦截关键词，说明被拦了
     if (html.includes('登录后查看') || html.includes('请登录') || html.includes('captcha') || html.includes('verify')) {
       return res.json({ ok: false, error: '请求被拦截，可能需要更换 IP 或稍后再试' });
     }
 
-    // 从 HTML 里提取 __INITIAL_STATE__
     const match = html.match(/window\.__INITIAL_STATE__\s*=\s*(\{[\s\S]*?\});?\s*(?:<\/script>|$)/);
     if (!match) {
       return res.json({ ok: false, error: '未找到数据，页面结构可能已变化' });
     }
 
-    // 关键：把 undefined 处理成合法 JSON
-    let raw = match[1]
+    let rawState = match[1]
       .replace(/:undefined/g, ':null')
       .replace(/,undefined/g, ',null')
       .replace(/undefined,/g, 'null,')
@@ -45,13 +67,12 @@ app.all('/api/xhs-card', async (req, res) => {
 
     let state;
     try {
-      state = JSON.parse(raw);
+      state = JSON.parse(rawState);
     } catch (e) {
       return res.json({ ok: false, error: 'JSON 解析失败: ' + e.message });
     }
 
-    // 兼容更多数据路径
-    const note =
+    let note =
       state.noteData?.data?.noteData ||
       state.noteData?.normalNotePreloadData ||
       (state.note?.noteDetailMap && Object.values(state.note.noteDetailMap)[0]?.note) ||
@@ -61,29 +82,58 @@ app.all('/api/xhs-card', async (req, res) => {
       return res.json({ ok: false, error: '解析数据失败，数据结构已变化' });
     }
 
-    // 提取图片 URL
-    const images = (note.imageList || []).map(img => {
-      let imgUrl = img.urlDefault || img.url || img;
+    const interact = note.interactInfo || note.interact || {};
+    const likedCount = note.likedCount ?? interact.likedCount ?? interact.likeCount ?? note.likeCount ?? 0;
+    const commentCount = note.commentCount ?? interact.commentCount ?? note.commentsCount ?? 0;
+    const collectedCount = note.collectedCount ?? interact.collectedCount ?? interact.collectCount ?? note.collectCount ?? 0;
+
+    const user = note.user || note.userInfo || {};
+    const author = user.nickname || user.nickName || user.name || '';
+    const avatar = user.avatar || user.image || user.headPhoto || '';
+
+    const images = (note.imageList || note.images || []).map(img => {
+      let imgUrl = img.urlDefault || img.url || img.infoList?.[0]?.url || img;
       if (typeof imgUrl === 'string') {
         imgUrl = imgUrl.replace(/\\u002F/g, '/');
         if (imgUrl.startsWith('//')) imgUrl = 'https:' + imgUrl;
+        if (imgUrl.startsWith('http://')) imgUrl = imgUrl.replace('http://', 'https://');
       }
       return imgUrl;
-    }).filter(Boolean);
+    }).filter(u => typeof u === 'string' && u.startsWith('http'));
+
+    let comments = [];
+    const rawComments =
+      note.comments ||
+      note.commentList ||
+      state.noteData?.data?.comments ||
+      state.comment?.comments ||
+      [];
+
+    if (Array.isArray(rawComments)) {
+      comments = rawComments.slice(0, 25).map(c => {
+        const u = c.user || c.userInfo || {};
+        return {
+          user: u.nickname || u.nickName || u.name || '匿名',
+          content: c.content || c.text || '',
+          ipLocation: c.ipLocation || c.ip || ''
+        };
+      }).filter(c => c.content);
+    }
 
     res.json({
       ok: true,
       note: {
         title: note.title || '',
-        desc: note.desc || '',
-        author: note.user?.nickname || '',
-        avatar: note.user?.avatar || '',
-        images: images,
+        desc: note.desc || note.description || '',
+        author,
+        avatar,
+        images,
         imageCount: images.length,
-        likedCount: note.likedCount || 0,
-        commentCount: note.commentCount || 0,
-        collectedCount: note.collectedCount || 0,
-        url: url
+        likedCount: Number(likedCount) || 0,
+        commentCount: Number(commentCount) || 0,
+        collectedCount: Number(collectedCount) || 0,
+        comments,
+        url: finalUrl
       }
     });
 
@@ -92,7 +142,6 @@ app.all('/api/xhs-card', async (req, res) => {
   }
 });
 
-// 图片转 base64 接口
 app.post('/api/xhs-images', async (req, res) => {
   try {
     const { urls } = req.body;
